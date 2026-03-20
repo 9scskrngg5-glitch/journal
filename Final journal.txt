@@ -1,0 +1,608 @@
+import { useState, useEffect, useMemo, useRef } from “react”;
+import {
+LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
+AreaChart, Area, CartesianGrid
+} from “recharts”;
+
+// ─── Storage ──────────────────────────────────────────────────────────────────
+const STORAGE_KEYS = { trades: “tj_trades_v2”, tasks: “tj_tasks_v2” };
+
+const storageGet = async (key) => {
+try {
+const r = await window.storage.get(key);
+return r ? JSON.parse(r.value) : null;
+} catch { return null; }
+};
+const storageSet = async (key, val) => {
+try { await window.storage.set(key, JSON.stringify(val)); } catch { }
+};
+
+const uid = () => Math.random().toString(36).slice(2, 9);
+
+// ─── Stats helpers ─────────────────────────────────────────────────────────────
+const calcRR = (e, sl, tp) => {
+const risk = Math.abs(e - sl);
+const reward = Math.abs(tp - e);
+return risk ? (reward / risk).toFixed(2) : “”;
+};
+
+const buildEquity = (trades) => {
+let eq = 0;
+return trades
+.filter(t => t.result !== “”)
+.map((t, i) => {
+eq += Number(t.result);
+return { i: i + 1, eq: parseFloat(eq.toFixed(2)) };
+});
+};
+
+const computeStats = (trades) => {
+const closed = trades.filter(t => t.result !== “”);
+if (!closed.length) return null;
+const wins = closed.filter(t => Number(t.result) > 0);
+const losses = closed.filter(t => Number(t.result) < 0);
+const totalPnL = closed.reduce((acc, t) => acc + Number(t.result), 0);
+const totalWin = wins.reduce((a, t) => a + Number(t.result), 0);
+const totalLoss = Math.abs(losses.reduce((a, t) => a + Number(t.result), 0));
+const avgWin = wins.length ? totalWin / wins.length : 0;
+const avgLoss = losses.length ? totalLoss / losses.length : 0;
+const winRate = wins.length / closed.length;
+const expectancy = (winRate * avgWin) - ((1 - winRate) * avgLoss);
+const profitFactor = totalLoss ? totalWin / totalLoss : 0;
+const bestTrade = closed.reduce((best, t) => Number(t.result) > Number(best.result) ? t : best, closed[0]);
+const worstTrade = closed.reduce((worst, t) => Number(t.result) < Number(worst.result) ? t : worst, closed[0]);
+const streak = (() => {
+let cur = 0, max = 0;
+for (const t of […closed].reverse()) {
+if (Number(t.result) > 0) { cur++; max = Math.max(max, cur); } else cur = 0;
+}
+return max;
+})();
+let peak = 0, eq = 0, maxDD = 0;
+for (const t of closed) {
+eq += Number(t.result);
+if (eq > peak) peak = eq;
+const dd = peak - eq;
+if (dd > maxDD) maxDD = dd;
+}
+return {
+total: closed.length,
+winRate: (winRate * 100).toFixed(1),
+totalPnL: totalPnL.toFixed(2),
+avgWin: avgWin.toFixed(2),
+avgLoss: avgLoss.toFixed(2),
+expectancy: expectancy.toFixed(2),
+profitFactor: profitFactor.toFixed(2),
+maxDD: maxDD.toFixed(2),
+bestTrade: Number(bestTrade.result).toFixed(2),
+worstTrade: Number(worstTrade.result).toFixed(2),
+streak,
+};
+};
+
+// ─── Mistake Detection (from V5) ──────────────────────────────────────────────
+const detectMistakes = (trade) => {
+const flags = [];
+if (trade.rr && Number(trade.rr) < 1) flags.push(“RR < 1”);
+if (!trade.sl) flags.push(“Pas de SL”);
+if ((trade.emotion || “”).toLowerCase() === “revenge”) flags.push(“Revenge trade”);
+if (trade.confidence && Number(trade.confidence) < 4) flags.push(“Confiance faible”);
+return flags;
+};
+
+// ─── Regime Detection (from Final) ───────────────────────────────────────────
+const detectRegime = (trades) => {
+const closed = trades.filter(t => t.result !== “”);
+if (closed.length < 10) return null;
+const recent = closed.slice(0, 20).map(t => Number(t.result));
+const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
+const variance = recent.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / recent.length;
+if (variance > 5000) return “CHAOTIC”;
+if (avg > 0) return “TRENDING_UP”;
+if (avg < 0) return “DISTRIBUTION”;
+return “SIDEWAYS”;
+};
+
+const REGIME_META = {
+TRENDING_UP:  { label: “Trending ↑”,   color: “#00e5a0”, hint: “Momentum actif — suis la tendance” },
+DISTRIBUTION: { label: “Distribution”, color: “#f5a623”, hint: “Marché en rotation — réduis le risque” },
+SIDEWAYS:     { label: “Sideways”,      color: “#a0a8c8”, hint: “Range — attends une cassure claire” },
+CHAOTIC:      { label: “Chaotic ⚠”,    color: “#ff4d6d”, hint: “Volatilité extrême — NE TRADE PAS” },
+};
+
+// ─── Monte Carlo Risk Engine (from Final) ────────────────────────────────────
+const monteCarlo = (trades, sims = 400, len = 100, start = 1000) => {
+const closed = trades.filter(t => t.result !== “”);
+if (closed.length < 10) return null;
+const results = closed.map(t => Number(t.result));
+let ruin = 0;
+const ddList = [];
+for (let s = 0; s < sims; s++) {
+let eq = start, peak = start, maxDD = 0;
+for (let i = 0; i < len; i++) {
+eq += results[Math.floor(Math.random() * results.length)];
+if (eq <= 0) { ruin++; break; }
+peak = Math.max(peak, eq);
+maxDD = Math.max(maxDD, peak - eq);
+}
+ddList.push(maxDD);
+}
+return {
+avgDD: (ddList.reduce((a, b) => a + b, 0) / ddList.length).toFixed(0),
+ruinPct: ((ruin / sims) * 100).toFixed(1),
+};
+};
+
+// ─── AI Insight via Anthropic API ─────────────────────────────────────────────
+const fetchAIInsight = async (trades) => {
+const closed = trades.filter(t => t.result !== “”).slice(0, 20);
+if (closed.length < 3) return “Ajoute au moins 3 trades pour obtenir une analyse IA.”;
+
+const summary = closed.map(t =>
+`${t.pair} | Entrée: ${t.entry} | SL: ${t.sl} | TP: ${t.tp} | RR: ${t.rr} | PnL: ${t.result}$ | Émotion: ${t.emotion || "—"} | Setup: ${t.setup || "—"} | Confiance: ${t.confidence || "—"}/10${t.flags?.length ? ` | ⚠️ ${t.flags.join(”, “)}` : ""}`
+).join(”\n”);
+
+const prompt = `Tu es un coach de trading professionnel. Voici les derniers trades d'un trader:\n\n${summary}\n\nDonne une analyse courte (3-4 phrases max), directe et honnête: ce qui va, ce qui doit être corrigé, et une recommandation concrète. Tiens compte des émotions, setups et flags détectés. Sois précis, pas générique.`;
+
+const response = await fetch(“https://api.anthropic.com/v1/messages”, {
+method: “POST”,
+headers: { “Content-Type”: “application/json” },
+body: JSON.stringify({
+model: “claude-sonnet-4-20250514”,
+max_tokens: 1000,
+messages: [{ role: “user”, content: prompt }]
+})
+});
+const data = await response.json();
+return data.content?.[0]?.text || “Erreur lors de l’analyse.”;
+};
+
+// ─── Custom Tooltip ────────────────────────────────────────────────────────────
+const CustomTooltip = ({ active, payload }) => {
+if (!active || !payload?.length) return null;
+const val = payload[0].value;
+return (
+<div style={{
+background: “#0f1117”, border: `1px solid ${val >= 0 ? "#00e5a0" : "#ff4d6d"}`,
+borderRadius: 8, padding: “6px 12px”, fontSize: 13, color: val >= 0 ? “#00e5a0” : “#ff4d6d”
+}}>
+PnL: {val > 0 ? “+” : “”}{val}$
+</div>
+);
+};
+
+// ─── Stat Card ─────────────────────────────────────────────────────────────────
+const StatCard = ({ label, value, sub, color }) => (
+
+  <div style={{
+    background: "linear-gradient(135deg, #111420 0%, #0d0f18 100%)",
+    border: "1px solid #1e2235",
+    borderRadius: 14,
+    padding: "16px 20px",
+    display: "flex", flexDirection: "column", gap: 4
+  }}>
+    <span style={{ fontSize: 11, color: "#4a5070", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>{label}</span>
+    <span style={{ fontSize: 22, fontWeight: 700, color: color || "#e8eaf6", fontFamily: "'Syne', sans-serif", lineHeight: 1.1 }}>{value}</span>
+    {sub && <span style={{ fontSize: 11, color: "#3a4060" }}>{sub}</span>}
+  </div>
+);
+
+// ─── Main App ──────────────────────────────────────────────────────────────────
+export default function App() {
+const [tab, setTab] = useState(“dashboard”);
+const [trades, setTrades] = useState([]);
+const [tasks, setTasks] = useState([]);
+const [loaded, setLoaded] = useState(false);
+const [form, setForm] = useState({ pair: “BTC/USD”, session: “New York”, entry: “”, sl: “”, tp: “”, result: “”, rr: “”, emotion: “”, setup: “”, confidence: “” });
+const [taskInput, setTaskInput] = useState(””);
+const [aiInsight, setAiInsight] = useState(””);
+const [aiLoading, setAiLoading] = useState(false);
+const [showTradeForm, setShowTradeForm] = useState(false);
+const [filterPair, setFilterPair] = useState(“ALL”);
+
+// Load from storage
+useEffect(() => {
+(async () => {
+const t = await storageGet(STORAGE_KEYS.trades);
+const tk = await storageGet(STORAGE_KEYS.tasks);
+if (t) setTrades(t);
+if (tk) setTasks(tk);
+setLoaded(true);
+})();
+}, []);
+
+// Auto RR
+useEffect(() => {
+if (form.entry && form.sl && form.tp) {
+setForm(f => ({ …f, rr: calcRR(+f.entry, +f.sl, +f.tp) }));
+}
+}, [form.entry, form.sl, form.tp]);
+
+const equity = useMemo(() => buildEquity(trades), [trades]);
+const stats = useMemo(() => computeStats(trades), [trades]);
+const regime = useMemo(() => detectRegime(trades), [trades]);
+const mc = useMemo(() => monteCarlo(trades), [trades]);
+const pairs = useMemo(() => [“ALL”, …new Set(trades.map(t => t.pair))], [trades]);
+const filteredTrades = useMemo(() =>
+filterPair === “ALL” ? trades : trades.filter(t => t.pair === filterPair),
+[trades, filterPair]
+);
+
+const addTrade = async () => {
+if (!form.entry || !form.sl || !form.tp) return;
+const flags = detectMistakes(form);
+const t = { …form, id: uid(), result: form.result !== “” ? +form.result : “”, flags };
+const next = [t, …trades];
+setTrades(next);
+await storageSet(STORAGE_KEYS.trades, next);
+setForm(f => ({ …f, entry: “”, sl: “”, tp: “”, result: “”, rr: “”, emotion: “”, setup: “”, confidence: “” }));
+setShowTradeForm(false);
+};
+
+const deleteTrade = async (id) => {
+const next = trades.filter(t => t.id !== id);
+setTrades(next);
+await storageSet(STORAGE_KEYS.trades, next);
+};
+
+const addTask = async () => {
+if (!taskInput.trim()) return;
+const next = […tasks, { id: uid(), text: taskInput, done: false }];
+setTasks(next);
+await storageSet(STORAGE_KEYS.tasks, next);
+setTaskInput(””);
+};
+
+const toggleTask = async (id) => {
+const next = tasks.map(t => t.id === id ? { …t, done: !t.done } : t);
+setTasks(next);
+await storageSet(STORAGE_KEYS.tasks, next);
+};
+
+const deleteTask = async (id) => {
+const next = tasks.filter(t => t.id !== id);
+setTasks(next);
+await storageSet(STORAGE_KEYS.tasks, next);
+};
+
+const runAI = async () => {
+setAiLoading(true);
+setAiInsight(””);
+const insight = await fetchAIInsight(trades);
+setAiInsight(insight);
+setAiLoading(false);
+};
+
+if (!loaded) return (
+<div style={{ background: “#090b12”, minHeight: “100vh”, display: “flex”, alignItems: “center”, justifyContent: “center”, color: “#4a5070”, fontFamily: “sans-serif” }}>
+Chargement…
+</div>
+);
+
+const pnlColor = (v) => Number(v) > 0 ? “#00e5a0” : Number(v) < 0 ? “#ff4d6d” : “#4a5070”;
+
+return (
+<div style={{
+background: “#090b12”,
+minHeight: “100vh”,
+color: “#e8eaf6”,
+fontFamily: “‘DM Sans’, sans-serif”,
+maxWidth: 900,
+margin: “0 auto”,
+padding: “24px 20px 60px”
+}}>
+<style>{`@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap'); * { box-sizing: border-box; } input:focus { outline: none; border-color: #00e5a0 !important; } ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #1e2235; border-radius: 4px; } @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } } .fade-in { animation: fadeIn 0.3s ease forwards; } @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } } .pulse { animation: pulse 1.5s ease infinite; }`}</style>
+
+```
+  {/* Header */}
+  <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 28 }}>
+    <div>
+      <div style={{ fontSize: 11, color: "#2a3050", letterSpacing: "0.2em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace", marginBottom: 4 }}>
+        TRADING JOURNAL
+      </div>
+      <h1 style={{ fontSize: 28, fontWeight: 800, fontFamily: "'Syne', sans-serif", margin: 0, letterSpacing: "-0.02em" }}>
+        {stats ? (
+          <span style={{ color: Number(stats.totalPnL) >= 0 ? "#00e5a0" : "#ff4d6d" }}>
+            {Number(stats.totalPnL) >= 0 ? "+" : ""}{stats.totalPnL}$
+          </span>
+        ) : "Gilles"}
+      </h1>
+    </div>
+    <div style={{ display: "flex", gap: 6 }}>
+      {["dashboard", "trades", "tasks"].map(t => (
+        <button key={t} onClick={() => setTab(t)} style={{
+          padding: "7px 14px", borderRadius: 8, border: "1px solid",
+          borderColor: tab === t ? "#00e5a0" : "#1a1d2e",
+          background: tab === t ? "rgba(0,229,160,0.08)" : "transparent",
+          color: tab === t ? "#00e5a0" : "#3a4060",
+          cursor: "pointer", fontSize: 12, fontWeight: 600,
+          fontFamily: "'DM Mono', monospace", letterSpacing: "0.05em",
+          textTransform: "uppercase", transition: "all 0.2s"
+        }}>{t}</button>
+      ))}
+    </div>
+  </div>
+
+  {/* ── DASHBOARD ── */}
+  {tab === "dashboard" && (
+    <div className="fade-in">
+      {/* Stats grid */}
+      {stats ? (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 16 }}>
+          <StatCard label="Win Rate" value={`${stats.winRate}%`} color={Number(stats.winRate) >= 50 ? "#00e5a0" : "#ff4d6d"} sub={`${stats.total} trades`} />
+          <StatCard label="PnL Total" value={`${Number(stats.totalPnL) >= 0 ? "+" : ""}${stats.totalPnL}$`} color={pnlColor(stats.totalPnL)} />
+          <StatCard label="Expectancy" value={`${Number(stats.expectancy) >= 0 ? "+" : ""}${stats.expectancy}$`} color={Number(stats.expectancy) >= 0 ? "#00e5a0" : "#ff4d6d"} sub="par trade" />
+          <StatCard label="Profit Factor" value={stats.profitFactor} color={Number(stats.profitFactor) >= 1.5 ? "#00e5a0" : Number(stats.profitFactor) >= 1 ? "#f5a623" : "#ff4d6d"} sub="≥ 1.5 = bon" />
+          <StatCard label="Max Drawdown" value={`-${stats.maxDD}$`} color="#ff4d6d" sub="pic → creux" />
+          <StatCard label="Best Trade" value={`+${stats.bestTrade}$`} color="#00e5a0" sub={`Pire: ${stats.worstTrade}$`} />
+          <StatCard label="Win Streak" value={`${stats.streak}🔥`} sub={`Avg win: +${stats.avgWin}$`} />
+          <StatCard label="Avg Loss" value={`${stats.avgLoss}$`} color="#ff4d6d" sub={`Avg win: +${stats.avgWin}$`} />
+        </div>
+      ) : (
+        <div style={{ background: "#0f1117", border: "1px dashed #1e2235", borderRadius: 14, padding: 20, marginBottom: 16, color: "#2a3050", textAlign: "center", fontSize: 13 }}>
+          Ajoute des trades pour voir tes stats
+        </div>
+      )}
+
+      {/* Equity chart */}
+      <div style={{ background: "linear-gradient(135deg, #0f1117 0%, #0d0f18 100%)", border: "1px solid #1e2235", borderRadius: 14, padding: "20px 16px 8px", marginBottom: 16 }}>
+        <div style={{ fontSize: 11, color: "#4a5070", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace", marginBottom: 12 }}>Courbe d'équité</div>
+        {equity.length > 1 ? (
+          <ResponsiveContainer width="100%" height={160}>
+            <AreaChart data={equity}>
+              <defs>
+                <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#00e5a0" stopOpacity={0.15} />
+                  <stop offset="95%" stopColor="#00e5a0" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="#13162a" />
+              <XAxis dataKey="i" tick={{ fontSize: 10, fill: "#2a3050" }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fontSize: 10, fill: "#2a3050" }} axisLine={false} tickLine={false} width={45} />
+              <Tooltip content={<CustomTooltip />} />
+              <Area type="monotone" dataKey="eq" stroke="#00e5a0" strokeWidth={2} fill="url(#eqGrad)" dot={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        ) : (
+          <div style={{ height: 160, display: "flex", alignItems: "center", justifyContent: "center", color: "#2a3050", fontSize: 12 }}>
+            Pas assez de données
+          </div>
+        )}
+      </div>
+
+      {/* AI Coach */}
+      <div style={{ background: "linear-gradient(135deg, #0f1117 0%, #0d0f18 100%)", border: "1px solid #1e2235", borderRadius: 14, padding: 20 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <div style={{ fontSize: 11, color: "#4a5070", letterSpacing: "0.1em", textTransform: "uppercase", fontFamily: "'DM Mono', monospace" }}>AI Coach</div>
+          <button onClick={runAI} disabled={aiLoading || trades.filter(t => t.result !== "").length < 3} style={{
+            padding: "6px 14px", borderRadius: 8, border: "1px solid #1e2235",
+            background: "transparent", color: aiLoading ? "#2a3050" : "#00e5a0",
+            cursor: "pointer", fontSize: 11, fontFamily: "'DM Mono', monospace",
+            letterSpacing: "0.05em", transition: "all 0.2s"
+          }}>
+            {aiLoading ? "Analyse..." : "Analyser →"}
+          </button>
+        </div>
+        {aiLoading && (
+          <div className="pulse" style={{ color: "#2a3050", fontSize: 13 }}>L'IA analyse tes trades...</div>
+        )}
+        {aiInsight && !aiLoading && (
+          <div style={{ fontSize: 14, color: "#a0a8c8", lineHeight: 1.7, borderLeft: "2px solid #00e5a0", paddingLeft: 14 }}>
+            {aiInsight}
+          </div>
+        )}
+        {!aiInsight && !aiLoading && (
+          <div style={{ color: "#2a3050", fontSize: 13 }}>
+            {trades.filter(t => t.result !== "").length < 3
+              ? "Ajoute au moins 3 trades fermés pour activer l'IA."
+              : "Clique sur Analyser pour obtenir un coaching personnalisé."}
+          </div>
+        )}
+      </div>
+    </div>
+  )}
+
+  {/* ── TRADES ── */}
+  {tab === "trades" && (
+    <div className="fade-in">
+      {/* Add trade toggle */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 6 }}>
+          {pairs.map(p => (
+            <button key={p} onClick={() => setFilterPair(p)} style={{
+              padding: "5px 12px", borderRadius: 7, border: "1px solid",
+              borderColor: filterPair === p ? "#00e5a0" : "#1a1d2e",
+              background: filterPair === p ? "rgba(0,229,160,0.08)" : "transparent",
+              color: filterPair === p ? "#00e5a0" : "#3a4060",
+              cursor: "pointer", fontSize: 11, fontFamily: "'DM Mono', monospace"
+            }}>{p}</button>
+          ))}
+        </div>
+        <button onClick={() => setShowTradeForm(!showTradeForm)} style={{
+          padding: "8px 16px", borderRadius: 9, border: "none",
+          background: showTradeForm ? "#1a1d2e" : "#00e5a0",
+          color: showTradeForm ? "#4a5070" : "#000",
+          cursor: "pointer", fontSize: 12, fontWeight: 700,
+          fontFamily: "'DM Mono', monospace"
+        }}>{showTradeForm ? "Annuler" : "+ Nouveau trade"}</button>
+      </div>
+
+      {/* Trade form */}
+      {showTradeForm && (
+        <div className="fade-in" style={{ background: "#0f1117", border: "1px solid #1e2235", borderRadius: 14, padding: 20, marginBottom: 16 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            {[
+              { k: "pair", label: "Pair", ph: "BTC/USD" },
+              { k: "session", label: "Session", ph: "New York" },
+              { k: "entry", label: "Entrée", ph: "104500" },
+              { k: "sl", label: "Stop Loss", ph: "104000" },
+              { k: "tp", label: "Take Profit", ph: "105500" },
+              { k: "result", label: "Résultat ($)", ph: "+120" },
+              { k: "setup", label: "Setup", ph: "Break of structure" },
+              { k: "emotion", label: "Émotion", ph: "calme / revenge / fomo..." },
+              { k: "confidence", label: "Confiance (1-10)", ph: "7" },
+            ].map(({ k, label, ph }) => (
+              <div key={k}>
+                <label style={{ fontSize: 11, color: "#3a4060", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace" }}>{label}</label>
+                <input
+                  placeholder={ph}
+                  value={form[k]}
+                  onChange={e => setForm({ ...form, [k]: e.target.value })}
+                  style={{
+                    background: "#141720", border: "1px solid #1e2235", color: "#e8eaf6",
+                    padding: "8px 12px", borderRadius: 8, width: "100%", fontSize: 13,
+                    fontFamily: "'DM Mono', monospace", transition: "border-color 0.2s"
+                  }}
+                />
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 12 }}>
+            <span style={{ fontSize: 12, color: "#4a5070", fontFamily: "'DM Mono', monospace" }}>
+              R/R: <span style={{ color: form.rr ? "#00e5a0" : "#2a3050", fontWeight: 700 }}>{form.rr || "—"}</span>
+            </span>
+            <button onClick={addTrade} style={{
+              padding: "9px 20px", borderRadius: 9, border: "none",
+              background: "#00e5a0", color: "#000", cursor: "pointer",
+              fontSize: 13, fontWeight: 700, fontFamily: "'DM Mono', monospace"
+            }}>Valider →</button>
+          </div>
+        </div>
+      )}
+
+      {/* Trade list */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {filteredTrades.length === 0 && (
+          <div style={{ color: "#2a3050", textAlign: "center", padding: 40, fontSize: 13 }}>
+            Aucun trade enregistré
+          </div>
+        )}
+        {filteredTrades.map(t => (
+          <div key={t.id} style={{
+            background: "#0f1117", border: "1px solid #1a1d2e",
+            borderLeft: `3px solid ${t.result !== "" ? pnlColor(t.result) : "#1e2235"}`,
+            borderRadius: 12, padding: "12px 16px",
+            display: "flex", alignItems: "center", justifyContent: "space-between"
+          }}>
+            <div style={{ display: "flex", gap: 24, alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 700, fontFamily: "'Syne', sans-serif" }}>{t.pair}</div>
+                <div style={{ fontSize: 11, color: "#3a4060", fontFamily: "'DM Mono', monospace" }}>{t.session}</div>
+              </div>
+              <div style={{ fontSize: 11, color: "#4a5070", fontFamily: "'DM Mono', monospace" }}>
+                <div>Entry: {t.entry}</div>
+                <div>SL: {t.sl} / TP: {t.tp}</div>
+              </div>
+              {t.rr && (
+                <div style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#00e5a0" }}>
+                  R/R {t.rr}
+                </div>
+              )}
+              {(t.setup || t.emotion || t.confidence) && (
+                <div style={{ fontSize: 11, color: "#4a5070", fontFamily: "'DM Mono', monospace" }}>
+                  {t.setup && <div>{t.setup}</div>}
+                  {t.emotion && <div style={{ color: (t.emotion || "").toLowerCase() === "revenge" ? "#ff4d6d" : "#4a5070" }}>{t.emotion} {t.confidence ? `· ${t.confidence}/10` : ""}</div>}
+                </div>
+              )}
+              {t.flags?.length > 0 && (
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  {t.flags.map(f => (
+                    <span key={f} style={{
+                      fontSize: 10, padding: "2px 7px", borderRadius: 5,
+                      background: "rgba(255,77,109,0.12)", color: "#ff4d6d",
+                      border: "1px solid rgba(255,77,109,0.2)", fontFamily: "'DM Mono', monospace"
+                    }}>⚠ {f}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+              {t.result !== "" && (
+                <span style={{ fontSize: 15, fontWeight: 700, fontFamily: "'Syne', sans-serif", color: pnlColor(t.result) }}>
+                  {Number(t.result) > 0 ? "+" : ""}{t.result}$
+                </span>
+              )}
+              <button onClick={() => deleteTrade(t.id)} style={{
+                background: "none", border: "none", color: "#2a3050", cursor: "pointer", fontSize: 14,
+                padding: "2px 6px", borderRadius: 4, transition: "color 0.2s"
+              }} onMouseOver={e => e.target.style.color = "#ff4d6d"} onMouseOut={e => e.target.style.color = "#2a3050"}>
+                ✕
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+
+  {/* ── TASKS ── */}
+  {tab === "tasks" && (
+    <div className="fade-in">
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <input
+          value={taskInput}
+          onChange={e => setTaskInput(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && addTask()}
+          placeholder="Plan ta session (règles, focus, mindset...)"
+          style={{
+            flex: 1, background: "#0f1117", border: "1px solid #1e2235", color: "#e8eaf6",
+            padding: "10px 14px", borderRadius: 10, fontSize: 13,
+            fontFamily: "'DM Sans', sans-serif", transition: "border-color 0.2s"
+          }}
+        />
+        <button onClick={addTask} style={{
+          padding: "10px 18px", borderRadius: 10, border: "none",
+          background: "#00e5a0", color: "#000", cursor: "pointer",
+          fontSize: 13, fontWeight: 700
+        }}>+</button>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {tasks.length === 0 && (
+          <div style={{ color: "#2a3050", textAlign: "center", padding: 40, fontSize: 13 }}>
+            Aucune tâche
+          </div>
+        )}
+        {tasks.map(t => (
+          <div key={t.id} style={{
+            background: "#0f1117", border: "1px solid #1a1d2e",
+            borderRadius: 10, padding: "11px 14px",
+            display: "flex", alignItems: "center", gap: 10,
+            opacity: t.done ? 0.5 : 1, transition: "opacity 0.2s"
+          }}>
+            <button onClick={() => toggleTask(t.id)} style={{
+              width: 18, height: 18, borderRadius: 5, border: "1.5px solid",
+              borderColor: t.done ? "#00e5a0" : "#2a3050",
+              background: t.done ? "#00e5a0" : "transparent",
+              cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center"
+            }}>
+              {t.done && <span style={{ fontSize: 10, color: "#000", fontWeight: 700 }}>✓</span>}
+            </button>
+            <span style={{ flex: 1, fontSize: 13, textDecoration: t.done ? "line-through" : "none", color: t.done ? "#3a4060" : "#c0c4d8" }}>
+              {t.text}
+            </span>
+            <button onClick={() => deleteTask(t.id)} style={{
+              background: "none", border: "none", color: "#2a3050", cursor: "pointer", fontSize: 13
+            }} onMouseOver={e => e.target.style.color = "#ff4d6d"} onMouseOut={e => e.target.style.color = "#2a3050"}>✕</button>
+          </div>
+        ))}
+      </div>
+
+      {tasks.some(t => t.done) && (
+        <button onClick={async () => {
+          const next = tasks.filter(t => !t.done);
+          setTasks(next);
+          await storageSet(STORAGE_KEYS.tasks, next);
+        }} style={{
+          marginTop: 16, padding: "8px 14px", borderRadius: 8, border: "1px solid #1e2235",
+          background: "transparent", color: "#3a4060", cursor: "pointer", fontSize: 11,
+          fontFamily: "'DM Mono', monospace"
+        }}>Supprimer les tâches complètes</button>
+      )}
+    </div>
+  )}
+</div>
+```
+
+);
+}
